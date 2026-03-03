@@ -18,7 +18,9 @@ from augmentation import get_train_transforms, get_val_transforms
 # PATH CONFIGURATION
 # ============================
 
+DATA_DIR = "/content/temp_dataset/plantvillage dataset/color"
 SPLIT_DIR = "data/splits"
+
 CHECKPOINT_DIR = "/content/drive/MyDrive/plant_assets/checkpoints"
 BEST_MODEL_PATH = "/content/drive/MyDrive/plant_assets/best_model.pth"
 
@@ -51,21 +53,34 @@ def compute_class_weights(csv_path):
 
 def train():
 
+    train_csv = os.path.join(SPLIT_DIR, "train.csv")
+    val_csv = os.path.join(SPLIT_DIR, "val.csv")
+
     train_dataset = PlantDiseaseDataset(
-        os.path.join(SPLIT_DIR, "train.csv"),
+        train_csv,
         transform=get_train_transforms()
     )
 
     val_dataset = PlantDiseaseDataset(
-        os.path.join(SPLIT_DIR, "val.csv"),
+        val_csv,
         transform=get_val_transforms()
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=32,
-                              shuffle=True, num_workers=0, pin_memory=True)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=32,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=True
+    )
 
-    val_loader = DataLoader(val_dataset, batch_size=32,
-                            shuffle=False, num_workers=0, pin_memory=True)
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=32,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True
+    )
 
     # ----------------------------
     # MODEL
@@ -73,11 +88,11 @@ def train():
     model = build_resnet50()
     model.to(DEVICE)
 
-    class_weights = compute_class_weights(
-        os.path.join(SPLIT_DIR, "train.csv")
-    ).to(DEVICE)
-
+    class_weights = compute_class_weights(train_csv).to(DEVICE)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+    best_val_acc = 0.0
+    patience = 7
 
     # =============================
     # PHASE 1 — Train Head Only
@@ -90,65 +105,18 @@ def train():
         weight_decay=1e-4
     )
 
-    best_val_acc = 0.0
-    patience = 7
     epochs_no_improve = 0
 
     for epoch in range(5):
 
         print(f"\nPhase 1 - Epoch {epoch+1}/5")
 
-        model.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-
-        for images, labels in tqdm(train_loader):
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
-
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item() * images.size(0)
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
-
-        train_loss = running_loss / total
-        train_acc = correct / total
-
-        # Validation
-        model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_total = 0
-
-        with torch.no_grad():
-            for images, labels in tqdm(val_loader):
-                images, labels = images.to(DEVICE), labels.to(DEVICE)
-
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-
-                val_loss += loss.item() * images.size(0)
-                _, predicted = outputs.max(1)
-                val_total += labels.size(0)
-                val_correct += predicted.eq(labels).sum().item()
-
-        val_loss = val_loss / val_total
-        val_acc = val_correct / val_total
+        train_acc = run_epoch(model, train_loader, optimizer, criterion)
+        val_acc = validate(model, val_loader, criterion)
 
         print(f"Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f}")
 
-        torch.save({
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "val_acc": val_acc
-        }, f"{CHECKPOINT_DIR}/phase1_epoch_{epoch+1}.pth")
+        save_checkpoint(model, optimizer, val_acc, epoch, "phase1")
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
@@ -158,7 +126,7 @@ def train():
             epochs_no_improve += 1
 
         if epochs_no_improve >= patience:
-            print("Early stopping triggered in Phase 1.")
+            print("Early stopping in Phase 1.")
             break
 
     # =============================
@@ -176,59 +144,19 @@ def train():
     ], weight_decay=1e-4)
 
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=25)
-
     epochs_no_improve = 0
 
     for epoch in range(25):
 
         print(f"\nPhase 2 - Epoch {epoch+1}/25")
 
-        model.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-
-        for images, labels in tqdm(train_loader):
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
-
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item() * images.size(0)
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
-
-        train_acc = correct / total
-
-        # Validation
-        model.eval()
-        val_correct = 0
-        val_total = 0
-
-        with torch.no_grad():
-            for images, labels in tqdm(val_loader):
-                images, labels = images.to(DEVICE), labels.to(DEVICE)
-                outputs = model(images)
-                _, predicted = outputs.max(1)
-                val_total += labels.size(0)
-                val_correct += predicted.eq(labels).sum().item()
-
-        val_acc = val_correct / val_total
+        train_acc = run_epoch(model, train_loader, optimizer, criterion)
+        val_acc = validate(model, val_loader, criterion)
 
         print(f"Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f}")
 
         scheduler.step()
-
-        torch.save({
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "val_acc": val_acc
-        }, f"{CHECKPOINT_DIR}/phase2_epoch_{epoch+1}.pth")
+        save_checkpoint(model, optimizer, val_acc, epoch, "phase2")
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
@@ -239,10 +167,60 @@ def train():
             epochs_no_improve += 1
 
         if epochs_no_improve >= patience:
-            print("Early stopping triggered in Phase 2.")
+            print("Early stopping in Phase 2.")
             break
 
     print("Training complete.")
+
+
+# ============================
+# HELPER FUNCTIONS
+# ============================
+
+def run_epoch(model, loader, optimizer, criterion):
+    model.train()
+    correct = 0
+    total = 0
+
+    for images, labels in tqdm(loader):
+        images, labels = images.to(DEVICE), labels.to(DEVICE)
+
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        _, predicted = outputs.max(1)
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
+
+    return correct / total
+
+
+def validate(model, loader, criterion):
+    model.eval()
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for images, labels in loader:
+            images, labels = images.to(DEVICE), labels.to(DEVICE)
+            outputs = model(images)
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+
+    return correct / total
+
+
+def save_checkpoint(model, optimizer, val_acc, epoch, phase):
+    torch.save({
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "val_acc": val_acc
+    }, f"{CHECKPOINT_DIR}/{phase}_epoch_{epoch+1}.pth")
 
 
 if __name__ == "__main__":
